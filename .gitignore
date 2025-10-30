@@ -10,3 +10,5 @@ inference/outputs/*
 inference/log/*
 
 outputs
+
+.venv
