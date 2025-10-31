@@ -133,8 +133,8 @@ def cell_level_compare(wb_gt, wb_proc, sheet_name, cell_range):
         cell_proc = ws_proc[cell_name]
 
         if not compare_cell_value(cell_gt.value, cell_proc.value):
-            msg = f"Value difference at cell {cell_gt.coordinate}: ws_gt has {cell_gt.value},\
-                    ws_proc has {cell_proc.value}"
+            msg = f"""Value difference at [{sheet_name}!{cell_gt.coordinate}]:
+            answer <-> processed: [{cell_gt.value}] <-> [{cell_proc.value}], type({type(cell_gt.value)}) <-> type({type(cell_proc.value)})"""
             return False, msg
         
         # if not compare_fill_color(cell_gt.fill, cell_proc.fill):
@@ -185,7 +185,7 @@ def compare_workbooks(gt_file, proc_file, instruction_type, answer_position):
         result_list.append(result)
         msg_list.append(msg)
 
-    return all(result_list), ""
+    return all(result_list), msg_list
 
 
 def parse_option():
@@ -193,7 +193,7 @@ def parse_option():
     
     parser.add_argument('--model', type=str, default='llama', help='model name')
     parser.add_argument('--setting', type=str, default='single',
-        help='four setting: single, multi_react_exec, multi_row_exec, multi_row_react_exec')
+        help='four setting: single, multi_react_exec, multi_row_exec, multi_row_react_exec, univer')
     parser.add_argument('--dataset', type=str, default="all_data_912", help='dataset name')
 
     opt = parser.parse_args()
@@ -209,14 +209,17 @@ def evaluation(opt):
     eval_results = []
     for data in tqdm(dataset):
         test_case_results = []
-        for test_case_idx in range(3):
+        msg_list = []
+        for test_case_idx in range(1): # evaluate only the first test case
             gt_path = f"{dataset_path}/spreadsheet/{data['id']}/{test_case_idx + 1}_{data['id']}_answer.xlsx"
-            proc_path = f"{dataset_path}/spreadsheet/{data['id']}/{test_case_idx + 1}_{data['id']}_input.xlsx"
-            # proc_path = f"{dataset_path}/outputs/{opt.setting}_{opt.model}/{test_case_idx + 1}_{data['id']}_output.xlsx"
+            # proc_path = f"{dataset_path}/spreadsheet/{data['id']}/{test_case_idx + 1}_{data['id']}_input.xlsx"
+            proc_path = f"{dataset_path}/outputs/{opt.setting}_{opt.model}/{test_case_idx + 1}_{data['id']}_output.xlsx"
             try:
-                result, _ = compare_workbooks(gt_path, proc_path, data['instruction_type'], data['answer_position'])
-            except:
+                result, msg = compare_workbooks(gt_path, proc_path, data['instruction_type'], data['answer_position'])
+                msg_list.append(msg)
+            except Exception as e:
                 result = False
+                msg_list.append(f"Error: {str(e)}")
             test_case_results.append(int(result))
         soft_restriction = test_case_results.count(1) / len(test_case_results)
         hard_restriction = 0 if 0 in test_case_results else 1
@@ -226,9 +229,10 @@ def evaluation(opt):
             'test_case_results': test_case_results,
             'soft_restriction': soft_restriction,
             'hard_restriction': hard_restriction,
+            'msg': msg_list,
         })
     
-    with open(f'../outputs/eval_{opt.setting}_{opt.model}.json', 'w') as fp:
+    with open(f'{dataset_path}/outputs/eval_{opt.setting}_{opt.model}.json', 'w') as fp:
         json.dump(eval_results, fp, indent=4)
 
 

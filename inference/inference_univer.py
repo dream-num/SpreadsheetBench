@@ -8,20 +8,20 @@ import json
 import argparse
 import asyncio
 import time
-import shutil
-from typing import Dict, Any, List
+from typing import Dict, Any
 from asyncio import Semaphore
+from pathlib import Path
 
 # Try to import async libraries with clear error messages if missing
 try:
-    import aiohttp
+    import httpx
     import aiofiles
     from tenacity import retry, stop_after_attempt, wait_exponential, RetryError
     from tqdm.asyncio import tqdm as async_tqdm
 except ImportError as e:
     print(f"❌ Missing required dependencies. Please run the following command to install:")
-    print(f"   pip install aiohttp aiofiles tenacity")
-    print(f"   or: python -m pip install aiohttp aiofiles tenacity")
+    print(f"   pip install httpx aiofiles tenacity")
+    print(f"   or: python -m pip install httpx aiofiles tenacity")
     raise
 
 
@@ -58,9 +58,9 @@ class SlowStartController:
             self.current_limit += 1
             # Increase semaphore capacity
             self.semaphore._value += 1
-            print(f"   📈 Concurrency increased to: {self.current_limit}/{self.max_concurrency}")
+            # print(f"   📈 Concurrency increased to: {self.current_limit}/{self.max_concurrency}")
 
-        print(f"   ✅ Maximum concurrency reached: {self.max_concurrency}")
+        # print(f"   ✅ Maximum concurrency reached: {self.max_concurrency}")
 
     async def acquire(self):
         """Acquire execution permission"""
@@ -103,30 +103,31 @@ class AsyncTaskProcessor:
         self.api_url = api_url
         self.mock = mock
         self.retry_times = retry_times
-        self.session: aiohttp.ClientSession = None
+        self.session: httpx.AsyncClient = None
+        self.cookie = os.getenv('UNIVER_COOKIE') or "_univer=JVNDIQSSGB4TSUTHI5DHAQKCNJNFCMDUGZ3TE"
 
     async def initialize(self):
         """Initialize HTTP session"""
-        # Configure connection pool
-        connector = aiohttp.TCPConnector(
-            limit=100,  # Maximum connections
-            limit_per_host=30,  # Maximum connections per host
-            ttl_dns_cache=300  # DNS cache time in seconds
+        # Configure connection limits (equivalent to aiohttp.TCPConnector)
+        limits = httpx.Limits(
+            max_keepalive_connections=200,  # Maximum keep-alive connections
+            max_connections=200,  # Maximum connections
+            keepalive_expiry=300.0  # Keep-alive expiry in seconds
         )
 
         # Configure timeout
-        timeout = aiohttp.ClientTimeout(
-            total=300,  # Total timeout: 5 minutes
-            connect=60,  # Connection timeout: 1 minute
-            sock_read=120  # Read timeout: 2 minutes
+        timeout = httpx.Timeout(
+            timeout=600.0,  # Total timeout: 10 minutes
+            connect=60.0,   # Connection timeout: 1 minute
+            read=600.0      # Read timeout: 10 minutes
         )
 
-        self.session = aiohttp.ClientSession(
-            connector=connector,
+        self.session = httpx.AsyncClient(
+            limits=limits,
             timeout=timeout
         )
 
-        print(f"🌐 HTTP session initialized (connection pool: {connector.limit})")
+        print(f"🌐 HTTP session initialized (connection pool: {limits.max_connections})")
 
     async def close(self):
         """Close session"""
@@ -134,8 +135,35 @@ class AsyncTaskProcessor:
             await self.session.close()
             print(f"🌐 HTTP session closed")
 
+    def _parse_sse_event(self, event_text: str) -> Dict[str, Any]:
+        """Parse a single SSE event into a dictionary
+
+        Args:
+            event_text: Raw SSE event text (e.g., "data: {...}" or ": ping - ...")
+
+        Returns:
+            dict: Parsed event data or None for ping events
+        """
+        event_text = event_text.strip()
+
+        # Handle ping/keep-alive events
+        if event_text.startswith(': ping'):
+            return {'type': 'PING'}
+
+        # Extract data content
+        if event_text.startswith('data:'):
+            data_content = event_text[5:].strip()  # Remove 'data:' prefix
+
+            if data_content:
+                try:
+                    return json.loads(data_content)
+                except json.JSONDecodeError as e:
+                    return {'type': 'PARSE_ERROR', 'raw': data_content, 'error': str(e)}
+
+        return {'type': 'UNKNOWN', 'raw': event_text}
+
     @retry(
-        stop=stop_after_attempt(3),  # Retry up to 3 times
+        stop=stop_after_attempt(1),  # Retry up to 1 times
         wait=wait_exponential(multiplier=1, min=2, max=10),  # Exponential backoff: 2, 4, 8 seconds
         # reraise=True
     )
@@ -162,23 +190,108 @@ class AsyncTaskProcessor:
             async with aiofiles.open(input_file_path, 'rb') as f:
                 file_content = await f.read()
 
-            # Construct form data
-            form = aiohttp.FormData()
-            form.add_field(
-                'file',
-                file_content,
-                filename=os.path.basename(input_file_path),
-                content_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
-            )
-            form.add_field('task', json.dumps(task_data))
+            # Construct form data for httpx
+            files = {
+                'file': (
+                    os.path.basename(input_file_path),
+                    file_content,
+                    'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+                )
+            }
+            data = {
+                'task': json.dumps(task_data),
+            }
 
-            # Send request
-            async with self.session.post(self.api_url, data=form) as response:
-                if response.status == 200:
-                    result = await response.json()
-                    return result
+            # Send request with cookie
+            headers = {
+                'Cookie': self.cookie
+            }
+            # Use httpx.stream for SSE streaming (timeout: 10 minutes)
+            async with self.session.stream(
+                "POST",
+                self.api_url,
+                data=data,
+                files=files,
+                headers=headers,
+                timeout=600.0  # 10 minutes
+            ) as response:
+                if response.status_code != 200:
+                    # Try to get detailed error information from response body
+                    error_details = f"Status code: {response.status_code}"
+                    try:
+                        # httpx response.text is a property, not a coroutine
+                        response_text = response.text
+                        if response_text:
+                            # Try to parse as JSON
+                            try:
+                                error_json = json.loads(response_text)
+                                error_details = f"Status code: {response.status_code}, Response: {json.dumps(error_json, ensure_ascii=False)}"
+                            except json.JSONDecodeError:
+                                # If not JSON, use text directly (truncate if too long)
+                                if len(response_text) > 500:
+                                    error_details = f"Status code: {response.status_code}, Response (truncated): {response_text[:500]}..."
+                                else:
+                                    error_details = f"Status code: {response.status_code}, Response: {response_text}"
+                    except Exception as e:
+                        # If we can't read response body, at least include status code
+                        error_details = f"Status code: {response.status_code}, Failed to read response body: {str(e)}"
+                    raise Exception(error_details)
+
+                # SSE Stream Processing
+                buffer = ""
+                last_event = None
+
+                async for chunk in response.aiter_text():
+                    buffer += chunk
+
+                    # Process complete events (split by \n\n)
+                    while '\n\n' in buffer:
+                        event_text, buffer = buffer.split('\n\n', 1)
+
+                        if not event_text.strip():
+                            continue
+
+                        event_data = self._parse_sse_event(event_text)
+                        event_type = event_data.get('type')
+
+                        # Handle different event types
+                        if event_type == 'RUN_STARTED':
+                            # Task started, continue reading
+                            pass
+
+                        elif event_type == 'RUN_FINISHED':
+                            # Extract fileUrl and return
+                            result = event_data.get('result', {})
+                            file_url = result.get('fileUrl')
+                            if file_url:
+                                return {
+                                    "error": {"code": 1, "message": "success"},
+                                    "fileUrl": file_url
+                                }
+                            else:
+                                raise Exception(f"RUN_FINISHED event missing fileUrl: {json.dumps(event_data, ensure_ascii=False)}")
+
+                        elif event_type == 'RUN_ERROR':
+                            # Handle error event
+                            error_msg = event_data.get('message', 'Unknown error from SSE stream')
+                            error_code = event_data.get('code', 'UNKNOWN')
+                            raise Exception(f"SSE Error (code: {error_code}): {error_msg}")
+
+                        elif event_type == 'PING':
+                            # Keep-alive ping, ignore
+                            pass
+
+                        elif event_type == 'PARSE_ERROR':
+                            # Log parse errors but continue
+                            pass
+
+                        last_event = event_data
+
+                # Stream ended without RUN_FINISHED
+                if last_event:
+                    raise Exception(f"SSE stream ended unexpectedly. Last event: {json.dumps(last_event, ensure_ascii=False)}")
                 else:
-                    raise Exception(f"API returned status code: {response.status}")
+                    raise Exception("SSE stream ended without any events")
 
         except asyncio.TimeoutError:
             raise Exception("API call timeout")
@@ -213,13 +326,14 @@ class AsyncTaskProcessor:
                 raise FileNotFoundError(f"Input file not found: {input_file_path}")
 
         try:
-            async with self.session.get(file_url) as response:
-                if response.status == 200:
+            async with self.session.stream("GET", file_url) as response:
+                if response.status_code == 200:
                     async with aiofiles.open(output_path, 'wb') as f:
-                        await f.write(await response.read())
+                        async for chunk in response.aiter_bytes():
+                            await f.write(chunk)
                     return True
                 else:
-                    raise Exception(f"Download failed: status {response.status}")
+                    raise Exception(f"Download failed: status {response.status_code}")
         except asyncio.TimeoutError:
             raise Exception("File download timeout")
         except Exception as e:
@@ -260,17 +374,9 @@ class AsyncTaskProcessor:
             if not os.path.exists(input_file_path):
                 raise FileNotFoundError(f"Input file not found: {input_file_path}")
 
-            # Construct task data
-            task_data = {
-                "id": task['id'],
-                "instruction": task['instruction'],
-                "instruction_type": task['instruction_type'],
-                "answer_position": task['answer_position']
-            }
-
             # Call API (with auto retry)
             try:
-                api_result = await self.bench_run(input_file_path, task_data)
+                api_result = await self.bench_run(input_file_path, task)
             except RetryError as e:
                 # All retries failed
                 result['retry_count'] = self.retry_times
@@ -308,23 +414,18 @@ async def gen_solution_async(opt):
         opt: Command line arguments object
     """
     # Read dataset
-    dataset_path = os.path.abspath(f'../data/{opt.dataset}')
-    dataset_json_path = f'{dataset_path}/dataset.json'
-
-    if not os.path.exists(dataset_json_path):
-        raise FileNotFoundError(f"Dataset file not found: {dataset_json_path}")
-
-    with open(dataset_json_path, 'r', encoding='utf-8') as fp:
-        dataset = json.load(fp)
+    dataset_dir = Path(__file__).parent.parent / 'data' / opt.dataset
+    dataset_json_path = dataset_dir / 'dataset.json'
+    dataset = json.loads(dataset_json_path.read_text(encoding='utf-8'))
 
     # Create output folder
-    output_folder = f'{dataset_path}/outputs/univer_{opt.model}'
-    os.makedirs(output_folder, exist_ok=True)
+    output_folder = dataset_dir / 'outputs' / f'univer_{opt.model}'
+    output_folder.mkdir(parents=True, exist_ok=True)
     print(f"📁 Output folder: {output_folder}")
 
     # Create log folder
-    log_folder = 'log'
-    os.makedirs(log_folder, exist_ok=True)
+    log_folder = dataset_dir / 'log'
+    log_folder.mkdir(parents=True, exist_ok=True)
 
     # Initialize processor and controller
     processor = AsyncTaskProcessor(opt.api_url, opt.mock, opt.retry_times)
@@ -357,7 +458,7 @@ async def gen_solution_async(opt):
         """Task processing with concurrency limit"""
         async with controller:  # Auto acquire and release semaphore
             result = await processor.process_task(
-                task, dataset_path, output_folder
+                task, dataset_dir, output_folder
             )
 
             # Update statistics
@@ -367,10 +468,12 @@ async def gen_solution_async(opt):
                 stats['failed'] += 1
                 stats['errors'].append(result)
 
-                # Async write error log
-                log_file = f'{log_folder}/univer_{opt.model}.jsonl'
+            log_file = log_folder / f'univer_{opt.model}.jsonl'
+            try:
                 async with aiofiles.open(log_file, 'a', encoding='utf-8') as f:
                     await f.write(json.dumps(result, ensure_ascii=False) + '\n')
+            except Exception as e:
+                print(f"⚠️  Warning: Failed to write log entry for task {result.get('id', 'unknown')}: {e}")
 
             # Update progress bar
             pbar.update(1)
@@ -392,7 +495,7 @@ async def gen_solution_async(opt):
     finally:
         pbar.close()
         await controller.stop()
-        await processor.close()
+        await processor.session.aclose()
 
     # Calculate elapsed time
     elapsed_time = time.time() - stats['start_time']
@@ -407,9 +510,7 @@ async def gen_solution_async(opt):
     print(f"   Total time: {elapsed_time:.2f} seconds")
     print(f"   Avg speed: {stats['total']/elapsed_time:.2f} tasks/sec")
     print(f"   Output folder: {output_folder}")
-
-    if stats['failed'] > 0:
-        print(f"   Error log: {log_folder}/univer_{opt.model}.jsonl")
+    print(f"   Log file: {log_folder}/univer_{opt.model}.jsonl")
 
     print("=" * 60)
 
@@ -433,8 +534,8 @@ def parse_option():
     parser.add_argument('--api_url', type=str,
                        default="https://arena.univer.plus/arena-api/bench/run",
                        help='Univer API URL')
-    parser.add_argument('--mock', action='store_true', default=True,
-                       help='Use mock API (default: True)')
+    parser.add_argument('--mock', action='store_true', default=False,
+                       help='Use mock API (default: False)')
 
     # Concurrency control parameters
     parser.add_argument('--max_workers', type=int, default=20,
