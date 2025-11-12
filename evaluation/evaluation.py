@@ -202,8 +202,14 @@ def parse_option():
 
 
 def evaluation(opt):
-    dataset_path = os.path.abspath(f'../data/{opt.dataset}')
-    with open(f'{dataset_path}/dataset.json', 'r') as fp:
+    # Get the directory where this script is located
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    # Navigate to the data directory relative to the script location
+    dataset_path = os.path.join(script_dir, '..', 'data', opt.dataset)
+    dataset_path = os.path.abspath(dataset_path)
+    
+    dataset_json_path = os.path.join(dataset_path, 'dataset.json')
+    with open(dataset_json_path, 'r') as fp:
         dataset = json.load(fp)
 
     eval_results = []
@@ -211,9 +217,14 @@ def evaluation(opt):
         test_case_results = []
         msg_list = []
         for test_case_idx in range(1): # evaluate only the first test case
-            gt_path = f"{dataset_path}/spreadsheet/{data['id']}/{test_case_idx + 1}_{data['id']}_answer.xlsx"
-            # proc_path = f"{dataset_path}/spreadsheet/{data['id']}/{test_case_idx + 1}_{data['id']}_input.xlsx"
-            proc_path = f"{dataset_path}/outputs/{opt.setting}_{opt.model}/{test_case_idx + 1}_{data['id']}_output.xlsx"
+            answer_filename = f"{test_case_idx + 1}_{data['id']}_answer.xlsx"
+            gt_path = os.path.join(dataset_path, 'spreadsheet', str(data['id']), answer_filename)
+            
+            # proc_path = os.path.join(dataset_path, 'spreadsheet', str(data['id']), f"{test_case_idx + 1}_{data['id']}_input.xlsx")
+            output_filename = f"{test_case_idx + 1}_{data['id']}_output.xlsx"
+            output_dir = f"{opt.setting}_{opt.model}"
+            proc_path = os.path.join(dataset_path, 'outputs', output_dir, output_filename)
+            
             try:
                 result, msg = compare_workbooks(gt_path, proc_path, data['instruction_type'], data['answer_position'])
                 msg_list.append(msg)
@@ -232,7 +243,9 @@ def evaluation(opt):
             'msg': msg_list,
         })
     
-    with open(f'{dataset_path}/outputs/eval_{opt.setting}_{opt.model}.json', 'w') as fp:
+    eval_filename = f"eval_{opt.setting}_{opt.model}.json"
+    eval_path = os.path.join(dataset_path, 'outputs', eval_filename)
+    with open(eval_path, 'w') as fp:
         json.dump(eval_results, fp, indent=4)
 
 
