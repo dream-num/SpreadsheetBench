@@ -209,7 +209,7 @@ def evaluation(opt):
     dataset_path = os.path.abspath(dataset_path)
     
     dataset_json_path = os.path.join(dataset_path, 'dataset.json')
-    with open(dataset_json_path, 'r') as fp:
+    with open(dataset_json_path, 'r', encoding='utf-8') as fp:
         dataset = json.load(fp)
 
     eval_results = []
@@ -245,7 +245,7 @@ def evaluation(opt):
     
     eval_filename = f"eval_{opt.setting}_{opt.model}.json"
     eval_path = os.path.join(dataset_path, 'outputs', eval_filename)
-    with open(eval_path, 'w') as fp:
+    with open(eval_path, 'w', encoding='utf-8') as fp:
         json.dump(eval_results, fp, indent=4)
 
 
